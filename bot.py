@@ -16,11 +16,15 @@ from discord.utils import escape_markdown
 from dotenv import load_dotenv
 import httpx
 
+from auth_store import delete_key, get_stored_key, init_db, save_key
+
 _bot_dir = Path(__file__).resolve().parent
+init_db()
 load_dotenv(_bot_dir.parent / ".env")
 load_dotenv(_bot_dir / ".env")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+# Optional: used only for Discord user IDs listed in BOT_OWNER_DISCORD_IDS (comma-separated).
 API_KEY = os.environ.get("PEEKOROBO_API_KEY")
 API_BASE = (os.environ.get("PEEKOROBO_API_BASE") or "https://api.peekorobo.com").rstrip("/")
 # Optional: set to your server ID for instant slash-command updates (global sync can take ~1 hour).
@@ -47,10 +51,14 @@ def _apply_team_thumbnail(embed: discord.Embed, team_number: int) -> None:
 
 # Default API limit for /peek_events (still paginated in Discord)
 DEFAULT_EVENTS_LIMIT = 24
+# GET /teams allows up to 100 per request
+DEFAULT_TEAMS_LIMIT = 24
+MAX_TEAMS_API_LIMIT = 100
 
 # Items per embed page (pagination buttons)
 PAGE_RANKINGS = 15
 PAGE_EVENTS = 3
+PAGE_TEAMS_LIST = 8
 PAGE_EVENT_KEYS = 30
 PAGE_AWARDS = 10
 PAGE_TEAM_EVENTS = 15
@@ -185,6 +193,18 @@ def _event_row_flat(ev: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _team_row_flat(t: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "team_number": t.get("team_number"),
+        "nickname": t.get("nickname"),
+        "city": t.get("city"),
+        "state_prov": t.get("state_prov"),
+        "country": t.get("country"),
+        "website": t.get("website"),
+        "district_key": t.get("district_key"),
+    }
+
+
 def _team_season_rows_csv(perfs: list[dict[str, Any]], team_number: int) -> str:
     keys = [
         "year",
@@ -237,12 +257,38 @@ async def _send_export_button_response(
         )
 
 
+def _owner_discord_ids() -> set[str]:
+    raw = os.environ.get("BOT_OWNER_DISCORD_IDS", "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def get_effective_api_key(user_id: int) -> str | None:
+    """Per-user key from SQLite, or env PEEKOROBO_API_KEY only for BOT_OWNER_DISCORD_IDS."""
+    k = get_stored_key(user_id)
+    if k:
+        return k
+    if API_KEY and str(user_id) in _owner_discord_ids():
+        return API_KEY
+    return None
+
+
+async def _require_api_key(interaction: discord.Interaction) -> str | None:
+    key = get_effective_api_key(interaction.user.id)
+    if key:
+        return key
+    await interaction.response.send_message(
+        "Link your Peekorobo API key with **`/peek_auth`** (private modal). "
+        f"Your key is stored on the bot host only for your Discord user ID. "
+        f"Get access at {SITE_URL} if you have it.",
+        ephemeral=True,
+    )
+    return None
+
+
 def _require_env() -> None:
     missing = []
     if not DISCORD_TOKEN:
         missing.append("DISCORD_TOKEN")
-    if not API_KEY:
-        missing.append("PEEKOROBO_API_KEY")
     if missing:
         print("Missing env: " + ", ".join(missing), file=sys.stderr)
         sys.exit(1)
@@ -259,10 +305,13 @@ def _build_help_embed() -> discord.Embed:
     """Static copy of slash command summaries (keep in sync when adding commands)."""
     body = """**General**
 `/peek` or `/peek_help` — Show this list of commands.
-`/peek_ping` — Verify API connectivity and your API key.
+`/peek_auth` — Save your Peekorobo API key (private modal; required for data commands).
+`/peek_auth_clear` — Remove your saved key from this bot.
+`/peek_ping` — Verify the API accepts your key.
 
 **Teams**
 `/peek_team` — Team profile, season ACE/RAW/record, registered events per season, and event-perf lines (optional `year`).
+`/peek_teams` — Search teams by season; optional `country`, `state_prov`, `district_key`, `city`, `limit` (paginated).
 `/peek_team_awards` — Awards for a team, newest season first (optional `year`).
 `/peek_team_events` — Event keys a team has played (optional `year`).
 
@@ -799,6 +848,58 @@ def _build_events_list_pages(events: list[dict[str, Any]], year: int) -> list[di
     return out
 
 
+def _format_team_list_entry(t: dict[str, Any]) -> str:
+    """One team block: linked number, nickname, location, district (for /peek_teams)."""
+    try:
+        tn = int(t.get("team_number"))
+    except (TypeError, ValueError):
+        return ""
+    url = f"{SITE_URL}/team/{tn}"
+    nick = _truncate(str(t.get("nickname") or "").strip(), 80)
+    city = str(t.get("city") or "").strip()
+    st = str(t.get("state_prov") or "").strip()
+    ctry = str(t.get("country") or "").strip()
+    dk = str(t.get("district_key") or "").strip()
+    loc = ", ".join(x for x in [city, st, ctry] if x)
+    head = f"**[{tn}]({url})**"
+    if nick:
+        head += f" · **{escape_markdown(nick)}**"
+    lines = [head]
+    if loc:
+        lines.append(escape_markdown(_truncate(loc, 120)))
+    if dk:
+        lines.append(f"`{dk}`")
+    return "\n".join(lines)
+
+
+def _build_teams_list_pages(rows: list[dict[str, Any]], year: int) -> list[discord.Embed]:
+    chunks = _chunk(rows, PAGE_TEAMS_LIST)
+    if not chunks:
+        return []
+    n = len(chunks)
+    out: list[discord.Embed] = []
+    for i, chunk in enumerate(chunks, start=1):
+        parts: list[str] = []
+        for t in chunk:
+            block = _format_team_list_entry(t)
+            if block:
+                parts.append(block)
+        body = "\n\n".join(parts)
+        if n > 1:
+            body += f"\n\n_{len(rows)} teams in this result._"
+        out.append(
+            _embed_with_page_footer(
+                title=f"Teams · {year}",
+                description=body,
+                color=COLOR_BRAND,
+                page=i,
+                total_pages=n,
+                url=f"{SITE_URL}/teams",
+            )
+        )
+    return out
+
+
 def _build_event_keys_pages(keys: list[str], year: int) -> list[discord.Embed]:
     chunks = _chunk(keys, PAGE_EVENT_KEYS)
     if not chunks:
@@ -1194,36 +1295,39 @@ class PeekoroboApi:
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(
             base_url=API_BASE,
-            headers={"X-API-Key": API_KEY},
             timeout=httpx.Timeout(45.0),
         )
 
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _get_json(self, path: str, params: dict | None = None) -> tuple[int, dict]:
-        r = await self._client.get(path, params=params)
+    async def _get_json(self, path: str, params: dict | None = None, *, api_key: str) -> tuple[int, dict]:
+        r = await self._client.get(
+            path,
+            params=params,
+            headers={"X-API-Key": api_key.strip()},
+        )
         try:
             data = r.json()
         except Exception:
             data = {}
         return r.status_code, data if isinstance(data, dict) else {}
 
-    async def authorize(self) -> tuple[int, dict]:
-        return await self._get_json("/authorize")
+    async def authorize(self, *, api_key: str) -> tuple[int, dict]:
+        return await self._get_json("/authorize", api_key=api_key)
 
-    async def team_perfs(self, team_number: int, year: int | None) -> tuple[int, dict]:
+    async def team_perfs(self, team_number: int, year: int | None, *, api_key: str) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if year is not None:
             params["year"] = year
-        return await self._get_json(f"/team_perfs/{team_number}", params or None)
+        return await self._get_json(f"/team_perfs/{team_number}", params or None, api_key=api_key)
 
-    async def team_lookup(self, team_number: int) -> tuple[int, dict]:
+    async def team_lookup(self, team_number: int, *, api_key: str) -> tuple[int, dict]:
         """GET /teams?team_number=&limit=1 — nickname, location, website, district."""
-        return await self._get_json("/teams", {"team_number": team_number, "limit": 1})
+        return await self._get_json("/teams", {"team_number": team_number, "limit": 1}, api_key=api_key)
 
-    async def event_rankings(self, event_key: str) -> tuple[int, dict]:
-        return await self._get_json(f"/event/{event_key}/rankings")
+    async def event_rankings(self, event_key: str, *, api_key: str) -> tuple[int, dict]:
+        return await self._get_json(f"/event/{event_key}/rankings", api_key=api_key)
 
     async def events_for_year(
         self,
@@ -1234,6 +1338,7 @@ class PeekoroboApi:
         district_key: str | None = None,
         country: str | None = None,
         city: str | None = None,
+        api_key: str,
     ) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if limit is not None:
@@ -1246,7 +1351,31 @@ class PeekoroboApi:
             params["country"] = country
         if city:
             params["city"] = city
-        return await self._get_json(f"/events/{year}", params or None)
+        return await self._get_json(f"/events/{year}", params or None, api_key=api_key)
+
+    async def teams_list(
+        self,
+        *,
+        year: int,
+        limit: int | None = None,
+        city: str | None = None,
+        state_prov: str | None = None,
+        district_key: str | None = None,
+        country: str | None = None,
+        api_key: str,
+    ) -> tuple[int, dict]:
+        params: dict[str, Any] = {"year": year}
+        if limit is not None:
+            params["limit"] = limit
+        if city:
+            params["city"] = city
+        if state_prov:
+            params["state_prov"] = state_prov
+        if district_key:
+            params["district_key"] = district_key
+        if country:
+            params["country"] = country
+        return await self._get_json("/teams", params, api_key=api_key)
 
     async def event_keys(
         self,
@@ -1255,6 +1384,7 @@ class PeekoroboApi:
         state_prov: str | None = None,
         district_key: str | None = None,
         country: str | None = None,
+        api_key: str,
     ) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if state_prov:
@@ -1263,41 +1393,78 @@ class PeekoroboApi:
             params["district_key"] = district_key
         if country:
             params["country"] = country
-        return await self._get_json(f"/events/{year}/keys", params or None)
+        return await self._get_json(f"/events/{year}/keys", params or None, api_key=api_key)
 
-    async def team_awards(self, team_number: int, year: int | None = None) -> tuple[int, dict]:
+    async def team_awards(self, team_number: int, year: int | None = None, *, api_key: str) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if year is not None:
             params["year"] = year
-        return await self._get_json(f"/team/{team_number}/awards", params or None)
+        return await self._get_json(f"/team/{team_number}/awards", params or None, api_key=api_key)
 
-    async def team_events(self, team_number: int, year: int | None = None) -> tuple[int, dict]:
+    async def team_events(self, team_number: int, year: int | None = None, *, api_key: str) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if year is not None:
             params["year"] = year
-        return await self._get_json(f"/team/{team_number}/events", params or None)
+        return await self._get_json(f"/team/{team_number}/events", params or None, api_key=api_key)
 
-    async def event_teams(self, event_key: str) -> tuple[int, dict]:
-        return await self._get_json(f"/event/{event_key}/teams")
+    async def event_teams(self, event_key: str, *, api_key: str) -> tuple[int, dict]:
+        return await self._get_json(f"/event/{event_key}/teams", api_key=api_key)
 
-    async def event_matches(self, event_key: str, team_number: int | None = None) -> tuple[int, dict]:
+    async def event_matches(self, event_key: str, team_number: int | None = None, *, api_key: str) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if team_number is not None:
             params["team_number"] = str(team_number)
-        return await self._get_json(f"/event/{event_key}/matches", params or None)
+        return await self._get_json(f"/event/{event_key}/matches", params or None, api_key=api_key)
 
-    async def event_awards(self, event_key: str, team_number: int | None = None) -> tuple[int, dict]:
+    async def event_awards(self, event_key: str, team_number: int | None = None, *, api_key: str) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if team_number is not None:
             params["team_number"] = team_number
-        return await self._get_json(f"/event/{event_key}/awards", params or None)
+        return await self._get_json(f"/event/{event_key}/awards", params or None, api_key=api_key)
 
-    async def event_perfs(self, event_key: str) -> tuple[int, dict]:
-        return await self._get_json(f"/event/{event_key}/event_perfs")
+    async def event_perfs(self, event_key: str, *, api_key: str) -> tuple[int, dict]:
+        return await self._get_json(f"/event/{event_key}/event_perfs", api_key=api_key)
 
-    async def event_perf_for_team(self, event_key: str, team_key: str) -> tuple[int, dict]:
+    async def event_perf_for_team(self, event_key: str, team_key: str, *, api_key: str) -> tuple[int, dict]:
         """GET /event/{event_key}/event_perfs/{team_key} — team_key e.g. 254 or frc254"""
-        return await self._get_json(f"/event/{event_key}/event_perfs/{team_key}")
+        return await self._get_json(f"/event/{event_key}/event_perfs/{team_key}", api_key=api_key)
+
+
+class PeekoroboAuthModal(discord.ui.Modal, title="Link Peekorobo API key"):
+    api_key_field = discord.ui.TextInput(
+        label="X-API-Key",
+        placeholder="Paste your key (only you see this)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=256,
+    )
+
+    def __init__(self) -> None:
+        super().__init__(timeout=300.0)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        key = str(self.api_key_field.value).strip()
+        if not key:
+            await interaction.response.send_message("Empty key.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        status, data = await api.authorize(api_key=key)
+        if status == 200 and data.get("authorized"):
+            save_key(interaction.user.id, key)
+            e = _base_embed(title="API key saved", color=COLOR_SUCCESS)
+            e.description = (
+                "Your key is stored for this bot and used for your slash commands. "
+                "Remove it anytime with **`/peek_auth_clear`**."
+            )
+            await interaction.followup.send(embed=e, ephemeral=True)
+        elif status == 401:
+            e = _base_embed(title="Invalid key", color=COLOR_ERR)
+            e.description = "The API rejected this key. It was **not** saved."
+            await interaction.followup.send(embed=e, ephemeral=True)
+        else:
+            e = _base_embed(title="API error", color=COLOR_ERR)
+            e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
+            await interaction.followup.send(embed=e, ephemeral=True)
 
 
 class PeekoroboClient(discord.Client):
@@ -1346,8 +1513,11 @@ async def on_close() -> None:
 
 @client.tree.command(name="peek_ping", description="Verify API connectivity and your API key")
 async def peek_ping(interaction: discord.Interaction) -> None:
+    key = await _require_api_key(interaction)
+    if not key:
+        return
     await interaction.response.defer(thinking=True)
-    status, data = await api.authorize()
+    status, data = await api.authorize(api_key=key)
     ex = _json_export({"http_status": status, "api_base": API_BASE, "response": data})
     if status == 200 and data.get("authorized"):
         e = _base_embed(title="API connected", color=COLOR_SUCCESS)
@@ -1355,7 +1525,7 @@ async def peek_ping(interaction: discord.Interaction) -> None:
         await send_embed_with_export(interaction, e, export_json=ex)
     elif status == 401:
         e = _base_embed(title="Unauthorized", color=COLOR_ERR)
-        e.description = "The API rejected `X-API-Key`. Check `PEEKOROBO_API_KEY` in `.env`."
+        e.description = "The API rejected `X-API-Key`. Update it with **`/peek_auth`**."
         await send_embed_with_export(interaction, e, export_json=ex)
     else:
         e = _base_embed(title="API error", color=COLOR_ERR)
@@ -1373,17 +1543,34 @@ async def peek_help(interaction: discord.Interaction) -> None:
     await _send_help_response(interaction)
 
 
+@client.tree.command(name="peek_auth", description="Save your Peekorobo API key for this bot (private modal)")
+async def peek_auth(interaction: discord.Interaction) -> None:
+    await interaction.response.send_modal(PeekoroboAuthModal())
+
+
+@client.tree.command(name="peek_auth_clear", description="Remove your saved Peekorobo API key from this bot")
+async def peek_auth_clear(interaction: discord.Interaction) -> None:
+    delete_key(interaction.user.id)
+    await interaction.response.send_message(
+        "Your saved API key has been removed from this bot. Use **`/peek_auth`** to add one again.",
+        ephemeral=True,
+    )
+
+
 @client.tree.command(
     name="peek_team",
     description="Team profile, season stats, all registered events per season, and event_perfs when available",
 )
 @app_commands.describe(team_number="FRC team number (e.g. 254)", year="Filter to one season (optional)")
 async def peek_team(interaction: discord.Interaction, team_number: int, year: int | None = None) -> None:
+    key = await _require_api_key(interaction)
+    if not key:
+        return
     await interaction.response.defer(thinking=True)
     (status, data), (st_meta, meta), (st_ev, evd) = await asyncio.gather(
-        api.team_perfs(team_number, year),
-        api.team_lookup(team_number),
-        api.team_events(team_number, year=None),
+        api.team_perfs(team_number, year, api_key=key),
+        api.team_lookup(team_number, api_key=key),
+        api.team_events(team_number, year=None, api_key=key),
     )
     team_info: dict[str, Any] | None = None
     if st_meta == 200 and isinstance(meta, dict):
@@ -1471,6 +1658,9 @@ async def peek_team(interaction: discord.Interaction, team_number: int, year: in
 )
 @app_commands.describe(event_key="Event key, e.g. 2025txdal or 2024cmp")
 async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
     year = _year_from_event_key(key)
@@ -1484,7 +1674,7 @@ async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
         )
         return
 
-    status, data = await api.events_for_year(year, limit=None)
+    status, data = await api.events_for_year(year, limit=None, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1523,9 +1713,12 @@ async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
 @client.tree.command(name="peek_rankings", description="Full event rankings (W–L–T, DQ)")
 @app_commands.describe(event_key="Event key, e.g. 2025txdal or 2024cmp")
 async def peek_rankings(interaction: discord.Interaction, event_key: str) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
-    status, data = await api.event_rankings(key)
+    status, data = await api.event_rankings(key, api_key=ak)
     if status == 404:
         e = _base_embed(title="No rankings", color=COLOR_WARN)
         e.description = f"No rankings for `{key}`."
@@ -1585,6 +1778,9 @@ async def peek_events(
     district_key: str | None = None,
     country: str | None = None,
 ) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     status, data = await api.events_for_year(
         year,
@@ -1592,6 +1788,7 @@ async def peek_events(
         state_prov=state_prov,
         district_key=district_key,
         country=country,
+        api_key=ak,
     )
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
@@ -1635,6 +1832,93 @@ async def peek_events(
     )
 
 
+@client.tree.command(
+    name="peek_teams",
+    description="Search teams by season (location/district filters; paginated in Discord)",
+)
+@app_commands.describe(
+    year="Season year, e.g. 2025 (teams with EPA data for this season)",
+    limit="Max teams from API (1–100; default 24)",
+    city="Filter by city name",
+    state_prov="Filter by state/province code",
+    district_key="District key filter",
+    country="Filter by country (e.g. USA, Canada)",
+)
+async def peek_teams(
+    interaction: discord.Interaction,
+    year: int,
+    limit: int = DEFAULT_TEAMS_LIMIT,
+    city: str | None = None,
+    state_prov: str | None = None,
+    district_key: str | None = None,
+    country: str | None = None,
+) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
+    await interaction.response.defer(thinking=True)
+    lim = max(1, min(int(limit), MAX_TEAMS_API_LIMIT))
+    status, data = await api.teams_list(
+        year=year,
+        limit=lim,
+        city=(city.strip() if city else None),
+        state_prov=(state_prov.strip() if state_prov else None),
+        district_key=(district_key.strip() if district_key else None),
+        country=(country.strip() if country else None),
+        api_key=ak,
+    )
+    if status != 200:
+        e = _base_embed(title="API error", color=COLOR_ERR)
+        e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"year": year, "http_status": status, "response": data}),
+        )
+        return
+
+    rows = data.get("team_info") or []
+    if not rows:
+        e = _base_embed(title=f"Teams · {year}", color=COLOR_WARN)
+        e.url = f"{SITE_URL}/teams"
+        e.description = "No teams match your filters."
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export(
+                {
+                    "year": year,
+                    "filters": {
+                        "city": city,
+                        "state_prov": state_prov,
+                        "district_key": district_key,
+                        "country": country,
+                        "limit": lim,
+                    },
+                    "team_info": [],
+                    "next": data.get("next"),
+                }
+            ),
+        )
+        return
+
+    pages = _build_teams_list_pages(rows, year)
+    filt = {
+        "city": city,
+        "state_prov": state_prov,
+        "district_key": district_key,
+        "country": country,
+        "limit": lim,
+    }
+    export_obj = {"year": year, "filters": filt, "team_info": rows, "next": data.get("next")}
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv([_team_row_flat(t) for t in rows]),
+        export_json=_json_export(export_obj),
+    )
+
+
 @client.tree.command(name="peek_event_keys", description="Event keys for a year (compact list for scripts / search)")
 @app_commands.describe(
     year="Season year",
@@ -1649,12 +1933,16 @@ async def peek_event_keys(
     district_key: str | None = None,
     country: str | None = None,
 ) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     status, data = await api.event_keys(
         year,
         state_prov=state_prov,
         district_key=district_key,
         country=country,
+        api_key=ak,
     )
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
@@ -1689,8 +1977,11 @@ async def peek_event_keys(
 @client.tree.command(name="peek_team_awards", description="Awards for a team, newest season first (optional year filter)")
 @app_commands.describe(team_number="FRC team number", year="Optional season year filter")
 async def peek_team_awards(interaction: discord.Interaction, team_number: int, year: int | None = None) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
-    status, data = await api.team_awards(team_number, year=year)
+    status, data = await api.team_awards(team_number, year=year, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1723,8 +2014,11 @@ async def peek_team_awards(interaction: discord.Interaction, team_number: int, y
 @client.tree.command(name="peek_team_events", description="Event keys a team has played (optional year filter)")
 @app_commands.describe(team_number="FRC team number", year="Optional season year")
 async def peek_team_events(interaction: discord.Interaction, team_number: int, year: int | None = None) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
-    status, data = await api.team_events(team_number, year=year)
+    status, data = await api.team_events(team_number, year=year, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1759,9 +2053,12 @@ async def peek_team_events(interaction: discord.Interaction, team_number: int, y
 )
 @app_commands.describe(event_key="Event key, e.g. 2025txdal")
 async def peek_event_teams(interaction: discord.Interaction, event_key: str) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
-    status, data = await api.event_teams(key)
+    status, data = await api.event_teams(key, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1798,9 +2095,12 @@ async def peek_event_matches(
     event_key: str,
     team_number: int | None = None,
 ) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
-    status, data = await api.event_matches(key, team_number=team_number)
+    status, data = await api.event_matches(key, team_number=team_number, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1837,9 +2137,12 @@ async def peek_event_awards(
     event_key: str,
     team_number: int | None = None,
 ) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
-    status, data = await api.event_awards(key, team_number=team_number)
+    status, data = await api.event_awards(key, team_number=team_number, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
@@ -1881,6 +2184,9 @@ async def peek_event_perfs(
     event_key: str,
     team_key: str | None = None,
 ) -> None:
+    ak = await _require_api_key(interaction)
+    if not ak:
+        return
     await interaction.response.defer(thinking=True)
     key = event_key.strip()
 
@@ -1903,7 +2209,7 @@ async def peek_event_perfs(
         return
 
     if tk is not None:
-        status, data = await api.event_perf_for_team(key, tk)
+        status, data = await api.event_perf_for_team(key, tk, api_key=ak)
         if status == 404:
             ek = key
             e = _base_embed(title=f"Event metrics · {ek} · Team {tk}", color=COLOR_WARN)
@@ -1937,7 +2243,7 @@ async def peek_event_perfs(
         )
         return
 
-    status, data = await api.event_perfs(key)
+    status, data = await api.event_perfs(key, api_key=ak)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
