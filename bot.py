@@ -389,6 +389,22 @@ def _year_from_event_key(event_key: str) -> int | None:
     return None
 
 
+def _team_link_md(team_number: Any) -> str:
+    """Markdown link to Peekorobo team page."""
+    try:
+        n = int(team_number)
+        return f"[{n}]({SITE_URL}/team/{n})"
+    except (TypeError, ValueError):
+        return str(team_number)
+
+
+def _team_list_links(teams: list[Any]) -> str:
+    """Comma-separated team links for alliance lines."""
+    if not teams:
+        return "—"
+    return ", ".join(_team_link_md(x) for x in teams)
+
+
 def _detail_from_api(data: Any) -> str:
     if isinstance(data, dict) and "detail" in data:
         return str(data["detail"])
@@ -609,14 +625,16 @@ def _build_ranking_pages(rows: list[dict[str, Any]], ek: str) -> list[discord.Em
     n = len(chunks)
     out: list[discord.Embed] = []
     for i, chunk in enumerate(chunks, start=1):
-        lines = [f"{'#':>3}  {'Team':>5}  {'W–L–T':>9}  {'DQ':>2}"]
+        lines: list[str] = ["_# · Team · W–L–T · DQ_"]
         for r in chunk:
             rank = r.get("rank")
             tn = r.get("team_number")
             w, l, t = r.get("wins"), r.get("losses"), r.get("ties")
             dq = r.get("dq", 0)
-            lines.append(f"{rank:>3}  {tn:>5}  {w}–{l}–{t}  {dq:>2}")
-        body = "```\n" + "\n".join(lines) + "\n```"
+            tlink = _team_link_md(tn)
+            rk = str(rank) if rank is not None else "—"
+            lines.append(f"`{rk:>3}` · {tlink} · **{w}–{l}–{t}** · `{dq}`")
+        body = "\n".join(lines)
         if n > 1 or len(rows) > len(chunk):
             body += f"\n_{len(rows)} teams total._"
         out.append(
@@ -1164,15 +1182,12 @@ def _build_match_lines(matches: list[dict[str, Any]]) -> list[str]:
         rwp = _fmt_win_prob_display(m.get("red_win_prob"))
         bwp = _fmt_win_prob_display(m.get("blue_win_prob"))
 
-        rts = ",".join(str(x) for x in red)
-        bts = ",".join(str(x) for x in blue)
-
         # Line 1: TBA-style code (from match_key suffix) + score + winner
         head = f"**`{code}`** · **{rs}**–**{bs}**"
         if win:
             head += f" · {win}"
-        # Line 2: alliances (explicit labels)
-        alliances = f"**Red** `{rts}` · **Blue** `{bts}`"
+        # Line 2: alliances (team numbers link to Peekorobo team pages)
+        alliances = f"**Red** {_team_list_links(red)} · **Blue** {_team_list_links(blue)}"
         # Line 3: full key for search / scripts
         key_line = f"`{mk}`" if mk else ""
         # Line 4: optional YT + model probs (no predicted schedule time)
