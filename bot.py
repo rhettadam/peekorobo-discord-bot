@@ -1,25 +1,18 @@
-"""
-Peekorobo Discord bot: slash commands that call the Peekorobo HTTP API.
-
-Environment:
-  DISCORD_TOKEN       — Bot token from Discord Developer Portal
-  PEEKOROBO_API_KEY   — Same X-API-Key as peekorobo.com / Swagger
-  PEEKOROBO_API_BASE  — API origin (default https://api.peekorobo.com), no trailing slash
-
-Install from repo root: pip install -e ".[discord]"
-Run from repo root: python discord_bot/bot.py
-"""
-
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 from dotenv import load_dotenv
 import httpx
 
@@ -30,15 +23,27 @@ load_dotenv(_bot_dir / ".env")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 API_KEY = os.environ.get("PEEKOROBO_API_KEY")
 API_BASE = (os.environ.get("PEEKOROBO_API_BASE") or "https://api.peekorobo.com").rstrip("/")
+# Optional: set to your server ID for instant slash-command updates (global sync can take ~1 hour).
+DISCORD_GUILD_ID_RAW = os.environ.get("DISCORD_GUILD_ID")
 
-# Styling (Peekorobo docs accent + Discord-friendly semantic colors)
-COLOR_BRAND = 0x3366CC
+# Styling — brand accent #FFDD00 + semantic colors for success / warn / error
+COLOR_BRAND = 0xFFDD00
 COLOR_SUCCESS = 0x57F287
-COLOR_WARN = 0xFEE75C
+COLOR_WARN = 0xFFB800
 COLOR_ERR = 0xED4245
 FOOTER_TEXT = "Peekorobo · FRC data"
 LOGO_URL = "https://www.peekorobo.com/assets/logo.png"
 SITE_URL = "https://www.peekorobo.com"
+
+
+def _team_avatar_url(team_number: int) -> str:
+    """Peekorobo CDN team avatar; same pattern as https://peekorobo.com/assets/avatars/1.png"""
+    return f"{SITE_URL}/assets/avatars/{int(team_number)}.png"
+
+
+def _apply_team_thumbnail(embed: discord.Embed, team_number: int) -> None:
+    embed.set_thumbnail(url=_team_avatar_url(team_number))
+
 
 # Default API limit for /peek_events (still paginated in Discord)
 DEFAULT_EVENTS_LIMIT = 24
@@ -49,13 +54,187 @@ PAGE_EVENTS = 3
 PAGE_EVENT_KEYS = 30
 PAGE_AWARDS = 10
 PAGE_TEAM_EVENTS = 15
-PAGE_EVENT_TEAMS = 45
-PAGE_MATCHES = 8
+# Rich roster lines (link + nickname + location) stay within embed limits
+PAGE_EVENT_TEAMS_DETAIL = 14
+PAGE_MATCHES = 5
 PAGE_EVENT_PERFS = 12
 PAGE_TEAM_SEASONS = 5
 MAX_TEAM_SEASON_EVENT_PERFS = 12
 MAX_REGISTERED_EVENTS_PER_SEASON = 50
 EMBED_DESC_SAFE = 3800
+FOOTER_TEXT_MAX = 400
+
+
+def _polish_footer_text() -> str:
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%d %H:%M UTC")
+    return _truncate(f"{FOOTER_TEXT} · Data as of {ts}", FOOTER_TEXT_MAX)
+
+
+def _apply_polish_footer(embed: discord.Embed, *, page_suffix: str | None = None) -> None:
+    base = _polish_footer_text()
+    if page_suffix:
+        text = _truncate(f"{base} · {page_suffix}", 2048)
+    else:
+        text = _truncate(base, 2048)
+    embed.set_footer(text=text, icon_url=LOGO_URL)
+
+
+def _rankings_to_csv(rows: list[dict[str, Any]]) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["rank", "team_number", "wins", "losses", "ties", "dq"])
+    for r in rows:
+        w.writerow(
+            [
+                r.get("rank"),
+                r.get("team_number"),
+                r.get("wins"),
+                r.get("losses"),
+                r.get("ties"),
+                r.get("dq", 0),
+            ]
+        )
+    return buf.getvalue().rstrip("\n")
+
+
+def _rankings_to_json(rows: list[dict[str, Any]], ek: str) -> str:
+    return json.dumps({"event_key": ek, "event_rankings": rows}, indent=2, default=str)
+
+
+def _event_perfs_to_csv(perfs: list[dict[str, Any]], ek: str) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["event_key", "team_number", "ace", "confidence", "raw", "auto_raw", "teleop_raw", "endgame_raw"])
+    for p in perfs:
+        w.writerow(
+            [
+                p.get("event_key") or ek,
+                p.get("team_number"),
+                p.get("ace"),
+                p.get("confidence"),
+                p.get("raw"),
+                p.get("auto_raw"),
+                p.get("teleop_raw"),
+                p.get("endgame_raw"),
+            ]
+        )
+    return buf.getvalue().rstrip("\n")
+
+
+def _event_perfs_to_json(perfs: list[dict[str, Any]], ek: str) -> str:
+    return json.dumps({"event_key": ek, "perfs": perfs}, indent=2, default=str)
+
+
+def _json_export(obj: Any) -> str:
+    """JSON for exports; normalizes dict keys to str (e.g. year keys in events_by_year)."""
+
+    def normalize(o: Any) -> Any:
+        if isinstance(o, dict):
+            return {str(k): normalize(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [normalize(x) for x in o]
+        return o
+
+    return json.dumps(normalize(obj), indent=2, default=str)
+
+
+def _dicts_to_csv(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(keys)
+    for r in rows:
+        w.writerow([r.get(k) for k in keys])
+    return buf.getvalue().rstrip("\n")
+
+
+def _single_column_csv(values: list[Any], header: str) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([header])
+    for v in values:
+        w.writerow([v])
+    return buf.getvalue().rstrip("\n")
+
+
+def _event_row_flat(ev: dict[str, Any]) -> dict[str, Any]:
+    meta = ev.get("event_data") or {}
+    loc = ev.get("location_info") or {}
+    return {
+        "event_key": ev.get("event_key"),
+        "name": meta.get("name"),
+        "start_date": str(meta.get("start_date")),
+        "end_date": str(meta.get("end_date")),
+        "event_type": meta.get("event_type"),
+        "city": loc.get("city"),
+        "state_prov": loc.get("state_prov"),
+        "country": loc.get("country"),
+        "week": ev.get("week"),
+        "district_key": ev.get("district_key"),
+        "district_name": ev.get("district_name"),
+        "website": ev.get("website"),
+    }
+
+
+def _team_season_rows_csv(perfs: list[dict[str, Any]], team_number: int) -> str:
+    keys = [
+        "year",
+        "team_number",
+        "wins",
+        "losses",
+        "ties",
+        "raw",
+        "ace",
+        "confidence",
+        "auto_raw",
+        "teleop_raw",
+        "endgame_raw",
+    ]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(keys)
+    for p in perfs:
+        row = []
+        for k in keys:
+            if k == "team_number":
+                row.append(p.get("team_number", team_number))
+            else:
+                row.append(p.get(k))
+        w.writerow(row)
+    return buf.getvalue().rstrip("\n")
+
+
+def _spoiler_safe(s: str) -> str:
+    """Avoid breaking Discord spoiler markers."""
+    return s.replace("||", "| |")
+
+
+async def _send_export_button_response(
+    interaction: discord.Interaction,
+    text: str,
+    *,
+    label: str,
+    filename: str,
+) -> None:
+    """Ephemeral reply for CSV/JSON button: spoiler if short, else file attachment."""
+    block = f"**{label}** (tap to reveal)\n||{_spoiler_safe(text)}||"
+    if len(block) <= 2000:
+        await interaction.response.send_message(content=block, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            content=f"{label} attached (too long for spoiler). UTF-8.",
+            ephemeral=True,
+            file=discord.File(io.BytesIO(text.encode("utf-8")), filename=filename),
+        )
 
 
 def _require_env() -> None:
@@ -72,7 +251,35 @@ def _require_env() -> None:
 def _base_embed(*, title: str | None = None, description: str | None = None, color: int = COLOR_BRAND) -> discord.Embed:
     e = discord.Embed(title=title, description=description, color=color, url=SITE_URL)
     e.set_author(name="Peekorobo", url=SITE_URL, icon_url=LOGO_URL)
-    e.set_footer(text=FOOTER_TEXT, icon_url=LOGO_URL)
+    _apply_polish_footer(e)
+    return e
+
+
+def _build_help_embed() -> discord.Embed:
+    """Static copy of slash command summaries (keep in sync when adding commands)."""
+    body = """**General**
+`/peek` or `/peek_help` — Show this list of commands.
+`/peek_ping` — Verify API connectivity and your API key.
+
+**Teams**
+`/peek_team` — Team profile, season ACE/RAW/record, registered events per season, and event-perf lines (optional `year`).
+`/peek_team_awards` — Awards for a team, newest season first (optional `year`).
+`/peek_team_events` — Event keys a team has played (optional `year`).
+
+**Finding events**
+`/peek_event` — One event: name, dates, week, district, location, website, webcast (`event_key` e.g. `2025txdal`).
+`/peek_events` — Events for a season; optional filters `country`, `state_prov`, `district_key`, `limit` (paginated).
+`/peek_event_keys` — Compact event keys for a year (same location filters; paginated).
+
+**At one event** (`event_key`)
+`/peek_rankings` — Full rankings (W–L–T, DQ).
+`/peek_event_teams` — Registered teams (links, nicknames, locations).
+`/peek_event_matches` — Matches, newest first (optional `team_number`).
+`/peek_event_awards` — Awards (optional `team_number`).
+`/peek_event_perfs` — ACE, σ, RAW, auto/tele/end breakdown (optional `team_key`: `254` or `frc254`).
+
+_All replies with data include **CSV** and **JSON** export buttons (tap for a private copy). Footers show when data was fetched (UTC). Long replies use ◀ / page / ▶; only you can use the buttons._"""
+    e = _base_embed(title="Peekorobo commands", description=_truncate(body, EMBED_DESC_SAFE))
     return e
 
 
@@ -95,6 +302,19 @@ def _short_iso_date(s: Any) -> str:
     if len(t) >= 10:
         return t[:10]
     return t
+
+
+def _event_week_display(week: Any) -> str | None:
+    """FRC stores week as 0-based; show as Week 1, Week 2, … (matches Peekorobo site)."""
+    if week is None:
+        return None
+    try:
+        wi = int(week)
+    except (TypeError, ValueError):
+        return None
+    if wi < 0:
+        return None
+    return f"Week {wi + 1}"
 
 
 def _truncate(s: str, max_len: int) -> str:
@@ -148,6 +368,18 @@ def _build_event_general_embed(ev: dict[str, Any], event_key: str) -> discord.Em
     lines: list[str] = [f"`{event_key}`", f"{sd} → {ed}"]
     if et:
         lines.append(f"Type: **{et}**")
+    wk = _event_week_display(ev.get("week"))
+    if wk:
+        lines.append(wk)
+    dk = str(ev.get("district_key") or "").strip()
+    dn = str(ev.get("district_name") or "").strip()
+    if dk or dn:
+        if dk and dn:
+            lines.append(f"District: `{dk}` · **{dn}**")
+        elif dk:
+            lines.append(f"District: `{dk}`")
+        else:
+            lines.append(f"District: **{dn}**")
     if loc_line:
         lines.append(loc_line)
     site = ev.get("website")
@@ -168,7 +400,7 @@ def _build_event_general_embed(ev: dict[str, Any], event_key: str) -> discord.Em
         url=event_url,
     )
     e.set_author(name="Peekorobo", url=SITE_URL, icon_url=LOGO_URL)
-    e.set_footer(text=FOOTER_TEXT, icon_url=LOGO_URL)
+    _apply_polish_footer(e)
     return e
 
 
@@ -180,23 +412,58 @@ def _embed_with_page_footer(
     page: int,
     total_pages: int,
     url: str | None = SITE_URL,
+    thumbnail_url: str | None = None,
 ) -> discord.Embed:
     e = discord.Embed(title=title, description=_truncate(description, EMBED_DESC_SAFE), color=color, url=url)
     e.set_author(name="Peekorobo", url=SITE_URL, icon_url=LOGO_URL)
-    e.set_footer(text=f"{FOOTER_TEXT} · Page {page}/{total_pages}", icon_url=LOGO_URL)
+    if thumbnail_url:
+        e.set_thumbnail(url=thumbnail_url)
+    _apply_polish_footer(e, page_suffix=f"Page {page}/{total_pages}")
     return e
 
 
 class EmbedPaginatorView(discord.ui.View):
-    """◀ / page count / ▶ — only the command invoker can click."""
+    """◀ / page / ▶ and optional CSV / JSON on one row (max 5 buttons). Only the invoker can click."""
 
-    def __init__(self, author_id: int, pages: list[discord.Embed], *, timeout: float = 600.0) -> None:
+    def __init__(
+        self,
+        author_id: int,
+        pages: list[discord.Embed],
+        *,
+        timeout: float = 600.0,
+        export_csv: str | None = None,
+        export_json: str | None = None,
+    ) -> None:
         super().__init__(timeout=timeout)
         self.author_id = author_id
         self.pages = pages
         self.index = 0
         self.message: discord.Message | discord.WebhookMessage | None = None
+        self._export_csv = export_csv
+        self._export_json = export_json
         self._sync_buttons()
+        if export_csv:
+            csv_data = export_csv
+
+            async def _on_csv(interaction: discord.Interaction) -> None:
+                await _send_export_button_response(
+                    interaction, csv_data, label="CSV", filename="peekorobo_export.csv"
+                )
+
+            b = discord.ui.Button(label="CSV", style=discord.ButtonStyle.secondary, row=0)
+            b.callback = _on_csv
+            self.add_item(b)
+        if export_json:
+            json_data = export_json
+
+            async def _on_json(interaction: discord.Interaction) -> None:
+                await _send_export_button_response(
+                    interaction, json_data, label="JSON", filename="peekorobo_export.json"
+                )
+
+            b = discord.ui.Button(label="JSON", style=discord.ButtonStyle.secondary, row=0)
+            b.callback = _on_json
+            self.add_item(b)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user is None or interaction.user.id != self.author_id:
@@ -239,16 +506,51 @@ class EmbedPaginatorView(discord.ui.View):
                 pass
 
 
-async def send_paginated(interaction: discord.Interaction, pages: list[discord.Embed], *, ephemeral: bool = False) -> None:
+async def send_paginated(
+    interaction: discord.Interaction,
+    pages: list[discord.Embed],
+    *,
+    ephemeral: bool = False,
+    export_csv: str | None = None,
+    export_json: str | None = None,
+) -> None:
     if not pages:
         return
     assert interaction.user is not None
+    if export_csv or export_json:
+        view = EmbedPaginatorView(
+            interaction.user.id,
+            pages,
+            export_csv=export_csv,
+            export_json=export_json,
+        )
+        msg = await interaction.followup.send(embed=pages[0], view=view, ephemeral=ephemeral, wait=True)
+        view.message = msg
+        return
     if len(pages) == 1:
         await interaction.followup.send(embed=pages[0], ephemeral=ephemeral)
         return
     view = EmbedPaginatorView(interaction.user.id, pages)
     msg = await interaction.followup.send(embed=pages[0], view=view, ephemeral=ephemeral, wait=True)
     view.message = msg
+
+
+async def send_embed_with_export(
+    interaction: discord.Interaction,
+    embed: discord.Embed,
+    *,
+    export_csv: str | None = None,
+    export_json: str | None = None,
+    ephemeral: bool = False,
+) -> None:
+    """Single embed with optional CSV/JSON buttons (same as one-page send_paginated)."""
+    await send_paginated(
+        interaction,
+        [embed],
+        export_csv=export_csv,
+        export_json=export_json,
+        ephemeral=ephemeral,
+    )
 
 
 def _build_ranking_pages(rows: list[dict[str, Any]], ek: str) -> list[discord.Embed]:
@@ -325,12 +627,13 @@ def _team_embed_title(tn: int, info: dict[str, Any] | None) -> str:
 def _format_single_event_perf_line(ep: dict[str, Any]) -> str:
     ek = str(ep.get("event_key") or "?").strip()
     ace = _fmt_num(ep.get("ace"))
+    conf = _fmt_num(ep.get("confidence"))
     raw = _fmt_num(ep.get("raw"))
     auto = _fmt_num(ep.get("auto_raw"))
     tele = _fmt_num(ep.get("teleop_raw"))
     end = _fmt_num(ep.get("endgame_raw"))
     return (
-        f"[{ek}]({SITE_URL}/event/{ek}) · ACE {ace} · RAW {raw} · Auto/Tele/End {auto}/{tele}/{end}"
+        f"[{ek}]({SITE_URL}/event/{ek}) · ACE {ace} · σ {conf} · RAW {raw} · Auto/Tele/End {auto}/{tele}/{end}"
     )
 
 
@@ -442,6 +745,7 @@ def _build_team_season_pages(
                 page=i,
                 total_pages=n,
                 url=team_url,
+                thumbnail_url=_team_avatar_url(tn),
             )
         )
     return out
@@ -465,7 +769,21 @@ def _build_events_list_pages(events: list[dict[str, Any]], year: int) -> list[di
             et = meta.get("event_type", "")
             city = loc.get("city", "")
             st = loc.get("state_prov", "")
-            parts.append(f"**[{ek}]({SITE_URL}/event/{ek})**\n{name}\n_{sd} → {ed}_ · {et}\n{city}, {st}")
+            date_line = f"_{sd} → {ed}_ · {et}"
+            wk = _event_week_display(ev.get("week"))
+            if wk:
+                date_line += f" · {wk}"
+            block = f"**[{ek}]({SITE_URL}/event/{ek})**\n{name}\n{date_line}\n{city}, {st}"
+            dk = str(ev.get("district_key") or "").strip()
+            dn = str(ev.get("district_name") or "").strip()
+            if dk or dn:
+                if dk and dn:
+                    block += f"\nDistrict: `{dk}` · **{dn}**"
+                elif dk:
+                    block += f"\nDistrict: `{dk}`"
+                else:
+                    block += f"\nDistrict: **{dn}**"
+            parts.append(block)
         body = "\n\n".join(parts)
         if n > 1:
             body += f"\n\n_{len(events)} events._"
@@ -503,6 +821,33 @@ def _build_event_keys_pages(keys: list[str], year: int) -> list[discord.Embed]:
     return out
 
 
+def _dedupe_team_awards(awards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per (event_key, award_name); keeps first occurrence (API order)."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for a in awards:
+        ek = str(a.get("event_key") or "").strip()
+        an = str(a.get("award_name") or "").strip()
+        key = (ek, an)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
+def _sort_team_awards_newest_first(awards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order by season year (event_key prefix) descending, then event_key, then award name."""
+    return sorted(
+        awards,
+        key=lambda a: (
+            -(_year_from_event_key(str(a.get("event_key") or "").strip()) or 0),
+            str(a.get("event_key") or ""),
+            str(a.get("award_name") or "").lower(),
+        ),
+    )
+
+
 def _build_team_awards_pages(awards: list[dict[str, Any]], team_number: int) -> list[discord.Embed]:
     chunks = _chunk(awards, PAGE_AWARDS)
     n = len(chunks)
@@ -525,6 +870,7 @@ def _build_team_awards_pages(awards: list[dict[str, Any]], team_number: int) -> 
                 page=i,
                 total_pages=n,
                 url=team_url,
+                thumbnail_url=_team_avatar_url(team_number),
             )
         )
     return out
@@ -548,19 +894,91 @@ def _build_team_events_pages(evs: list[str], team_number: int) -> list[discord.E
                 page=i,
                 total_pages=n,
                 url=team_url,
+                thumbnail_url=_team_avatar_url(team_number),
             )
         )
     return out
 
 
-def _build_event_teams_pages(nums: list[int], ek: str) -> list[discord.Embed]:
-    chunks = _chunk(nums, PAGE_EVENT_TEAMS)
+def _coerce_event_teams_rows(raw: Any) -> list[dict[str, Any]]:
+    """Normalize GET /event/…/teams payload: list of objects, or legacy list of team numbers."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            try:
+                tn = int(item.get("team_number"))
+            except (TypeError, ValueError):
+                continue
+            out.append(
+                {
+                    "team_number": tn,
+                    "nickname": str(item.get("nickname") or "").strip(),
+                    "city": str(item.get("city") or "").strip(),
+                    "state_prov": str(item.get("state_prov") or "").strip(),
+                    "country": str(item.get("country") or "").strip(),
+                }
+            )
+        else:
+            try:
+                n = int(item)
+                out.append(
+                    {
+                        "team_number": n,
+                        "nickname": "",
+                        "city": "",
+                        "state_prov": "",
+                        "country": "",
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+    out.sort(key=lambda r: int(r["team_number"]))
+    return out
+
+
+def _format_team_location_compact(city: str, state_prov: str, country: str) -> str:
+    parts = [x.strip() for x in (city, state_prov, country) if x and str(x).strip()]
+    return ", ".join(parts)
+
+
+def _format_event_team_line(row: dict[str, Any]) -> str:
+    try:
+        tn = int(row["team_number"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    url = f"{SITE_URL}/team/{tn}"
+    link = f"[**{tn}**]({url})"
+    nick = _truncate(str(row.get("nickname") or "").strip(), 72)
+    loc = _format_team_location_compact(
+        str(row.get("city") or ""),
+        str(row.get("state_prov") or ""),
+        str(row.get("country") or ""),
+    )
+    loc = _truncate(loc, 120)
+    parts: list[str] = [link]
+    if nick:
+        parts.append(f"**{escape_markdown(nick)}**")
+    if loc:
+        parts.append(escape_markdown(loc))
+    return " · ".join(parts)
+
+
+def _build_event_teams_pages(rows: list[dict[str, Any]], ek: str) -> list[discord.Embed]:
+    chunks = _chunk(rows, PAGE_EVENT_TEAMS_DETAIL)
     n = len(chunks)
+    total = len(rows)
     out: list[discord.Embed] = []
     for i, chunk in enumerate(chunks, start=1):
-        body = f"**{len(nums)}** teams\n\n`" + ", ".join(str(x) for x in chunk) + "`"
+        lines = [_format_event_team_line(r) for r in chunk]
+        lines = [ln for ln in lines if ln]
+        body = f"**{total}** teams\n\n" + "\n".join(lines)
         if n > 1:
-            body += f"\n\n_Page {i}: teams {chunk[0]}–{chunk[-1]}._"
+            t0 = int(chunk[0]["team_number"])
+            t1 = int(chunk[-1]["team_number"])
+            body += f"\n\n_Page {i}: teams {t0}–{t1}._"
+        body = _truncate(body, EMBED_DESC_SAFE)
         out.append(
             _embed_with_page_footer(
                 title=f"Teams · {ek}",
@@ -574,26 +992,113 @@ def _build_event_teams_pages(nums: list[int], ek: str) -> list[discord.Embed]:
     return out
 
 
+def _fmt_win_prob_display(x: Any) -> str:
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+        if 0 <= v <= 1:
+            return f"{v * 100:.1f}%"
+        return f"{v:.2f}"
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def _format_match_code_label(m: dict[str, Any]) -> str:
+    """Human-readable match code (same idea as layouts `k` suffix): qm12, sf1m3, f1m1 — not raw cl+mn."""
+    mk = str(m.get("match_key") or "").strip()
+    if mk and "_" in mk:
+        return mk.split("_")[-1].upper()
+    cl = str(m.get("comp_level") or "").lower()
+    sn = m.get("set_number")
+    mn = m.get("match_number")
+    if cl in ("qf", "sf", "f") and sn is not None and mn is not None:
+        return f"{cl}{sn}m{mn}".upper()
+    if mn is not None and cl:
+        return f"{cl}{mn}".upper()
+    return (cl or "?").upper()
+
+
+# TBA elimination order (oldest → newest). API sorts lexicographically, so reversing the list
+# does not put finals last-in-time first; we sort explicitly by round recency, then set/match desc.
+_COMP_LEVEL_RECENCY: dict[str, int] = {
+    "qm": 0,
+    "ef": 1,
+    "qf": 2,
+    "sf": 3,
+    "f": 4,
+}
+
+
+def _sort_matches_newest_first(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(m: dict[str, Any]) -> tuple[int, int, int]:
+        cl = str(m.get("comp_level") or "").lower().strip()
+        rec = _COMP_LEVEL_RECENCY.get(cl, 0)
+        try:
+            sn = int(m.get("set_number") or 0)
+        except (TypeError, ValueError):
+            sn = 0
+        try:
+            mn = int(m.get("match_number") or 0)
+        except (TypeError, ValueError):
+            mn = 0
+        # Higher recency / set / match = played later → sort first (negate for descending)
+        return (-rec, -sn, -mn)
+
+    return sorted(matches, key=key)
+
+
 def _build_match_lines(matches: list[dict[str, Any]]) -> list[str]:
+    """One block per match: short code from match_key, alliances, full key, YT + win probs."""
     lines: list[str] = []
     for m in matches:
-        cl = m.get("comp_level", "")
-        mn = m.get("match_number")
+        mk = str(m.get("match_key") or "").strip()
+        code = _format_match_code_label(m)
         red = m.get("red_teams") or []
         blue = m.get("blue_teams") or []
         rs = m.get("red_score")
         bs = m.get("blue_score")
-        win = m.get("winning_alliance", "")
+        win = str(m.get("winning_alliance") or "").strip()
+        yk = str(m.get("youtube_key") or "").strip()
+        rwp = _fmt_win_prob_display(m.get("red_win_prob"))
+        bwp = _fmt_win_prob_display(m.get("blue_win_prob"))
+
         rts = ",".join(str(x) for x in red)
         bts = ",".join(str(x) for x in blue)
-        lines.append(f"`{cl}{mn}` **{rs}**–**{bs}** {win}\n  R {rts} vs B {bts}")
+
+        # Line 1: TBA-style code (from match_key suffix) + score + winner
+        head = f"**`{code}`** · **{rs}**–**{bs}**"
+        if win:
+            head += f" · {win}"
+        # Line 2: alliances (explicit labels)
+        alliances = f"**Red** `{rts}` · **Blue** `{bts}`"
+        # Line 3: full key for search / scripts
+        key_line = f"`{mk}`" if mk else ""
+        # Line 4: optional YT + model probs (no predicted schedule time)
+        tail_parts: list[str] = []
+        if yk:
+            tail_parts.append(f"[YouTube](https://www.youtube.com/watch?v={yk})")
+        tail_parts.append(f"P(red) {rwp} · P(blue) {bwp}")
+        tail = " · ".join(tail_parts)
+
+        block = head + "\n" + alliances
+        if key_line:
+            block += "\n" + key_line
+        block += "\n" + tail
+        lines.append(block)
     return lines
 
 
-def _build_event_matches_pages(matches: list[dict[str, Any]], ek: str, total_count: int) -> list[discord.Embed]:
-    # Newest first (reverse API order)
-    rev = list(reversed(matches))
-    chunks = _chunk(rev, PAGE_MATCHES)
+def _build_event_matches_pages(
+    matches: list[dict[str, Any]],
+    ek: str,
+    total_count: int,
+    *,
+    team_number: int | None = None,
+) -> list[discord.Embed]:
+    # Caller passes matches already ordered newest first (see _sort_matches_newest_first).
+    thumb = _team_avatar_url(team_number) if team_number is not None else None
+    chunks = _chunk(matches, PAGE_MATCHES)
     if not chunks:
         return []
     n = len(chunks)
@@ -609,12 +1114,19 @@ def _build_event_matches_pages(matches: list[dict[str, Any]], ek: str, total_cou
                 page=i,
                 total_pages=n,
                 url=f"{SITE_URL}/event/{ek}",
+                thumbnail_url=thumb,
             )
         )
     return out
 
 
-def _build_event_awards_pages(rows: list[dict[str, Any]], ek: str) -> list[discord.Embed]:
+def _build_event_awards_pages(
+    rows: list[dict[str, Any]],
+    ek: str,
+    *,
+    team_number: int | None = None,
+) -> list[discord.Embed]:
+    thumb = _team_avatar_url(team_number) if team_number is not None else None
     chunks = _chunk(rows, PAGE_AWARDS)
     n = len(chunks)
     out: list[discord.Embed] = []
@@ -631,6 +1143,7 @@ def _build_event_awards_pages(rows: list[dict[str, Any]], ek: str) -> list[disco
                 page=i,
                 total_pages=n,
                 url=f"{SITE_URL}/event/{ek}",
+                thumbnail_url=thumb,
             )
         )
     return out
@@ -648,13 +1161,14 @@ def _build_event_perfs_pages(
     title = f"Event metrics · {ek}"
     if team_filter is not None:
         title = f"Event metrics · {ek} · Team {team_filter}"
+    thumb = _team_avatar_url(team_filter) if team_filter is not None else None
     out: list[discord.Embed] = []
     for i, chunk in enumerate(chunks, start=1):
-        lines = [f"{'Team':>5}  {'ACE':>8}  {'RAW':>8}  {'Auto':>7}  {'Tele':>7}  {'End':>7}"]
+        lines = [f"{'Team':>5}  {'ACE':>8}  {'σ':>6}  {'RAW':>8}  {'Auto':>7}  {'Tele':>7}  {'End':>7}"]
         for p in chunk:
             tn = p.get("team_number")
             lines.append(
-                f"{tn:>5}  {_fmt_num(p.get('ace')):>8}  {_fmt_num(p.get('raw')):>8}  "
+                f"{tn:>5}  {_fmt_num(p.get('ace')):>8}  {_fmt_num(p.get('confidence')):>6}  {_fmt_num(p.get('raw')):>8}  "
                 f"{_fmt_num(p.get('auto_raw')):>7}  {_fmt_num(p.get('teleop_raw')):>7}  {_fmt_num(p.get('endgame_raw')):>7}"
             )
         body = "```\n" + "\n".join(lines) + "\n```"
@@ -670,6 +1184,7 @@ def _build_event_perfs_pages(
                 page=i,
                 total_pages=n,
                 url=f"{SITE_URL}/event/{ek}",
+                thumbnail_url=thumb,
             )
         )
     return out
@@ -739,12 +1254,15 @@ class PeekoroboApi:
         *,
         state_prov: str | None = None,
         district_key: str | None = None,
+        country: str | None = None,
     ) -> tuple[int, dict]:
         params: dict[str, Any] = {}
         if state_prov:
             params["state_prov"] = state_prov
         if district_key:
             params["district_key"] = district_key
+        if country:
+            params["country"] = country
         return await self._get_json(f"/events/{year}/keys", params or None)
 
     async def team_awards(self, team_number: int, year: int | None = None) -> tuple[int, dict]:
@@ -798,8 +1316,27 @@ api = PeekoroboApi()
 async def on_ready() -> None:
     assert client.user is not None
     print(f"Logged in as {client.user} ({client.user.id})")
-    synced = await client.tree.sync()
-    print(f"Synced {len(synced)} command(s)")
+    if DISCORD_GUILD_ID_RAW and str(DISCORD_GUILD_ID_RAW).strip().isdigit():
+        gid = int(str(DISCORD_GUILD_ID_RAW).strip())
+        synced = await client.tree.sync(guild=discord.Object(id=gid))
+        print(f"Synced {len(synced)} guild command(s) to guild {gid} (instant in this server)")
+    else:
+        synced = await client.tree.sync()
+        print(
+            f"Synced {len(synced)} global command(s) (may take up to ~1 hour to appear everywhere; "
+            "set DISCORD_GUILD_ID for instant sync while testing)"
+        )
+
+
+async def _send_help_response(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=False)
+    he = _build_help_embed()
+    await send_embed_with_export(
+        interaction,
+        he,
+        export_csv=_single_column_csv([he.description or ""], "help_markdown"),
+        export_json=_json_export({"peek_help_markdown": he.description}),
+    )
 
 
 @client.event
@@ -811,18 +1348,29 @@ async def on_close() -> None:
 async def peek_ping(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     status, data = await api.authorize()
+    ex = _json_export({"http_status": status, "api_base": API_BASE, "response": data})
     if status == 200 and data.get("authorized"):
         e = _base_embed(title="API connected", color=COLOR_SUCCESS)
         e.description = f"**Base:** `{API_BASE}`\n**Status:** authorized"
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=ex)
     elif status == 401:
         e = _base_embed(title="Unauthorized", color=COLOR_ERR)
         e.description = "The API rejected `X-API-Key`. Check `PEEKOROBO_API_KEY` in `.env`."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=ex)
     else:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=ex)
+
+
+@client.tree.command(name="peek", description="Peekorobo slash command list (help)")
+async def peek(interaction: discord.Interaction) -> None:
+    await _send_help_response(interaction)
+
+
+@client.tree.command(name="peek_help", description="Same as /peek — list all Peekorobo slash commands")
+async def peek_help(interaction: discord.Interaction) -> None:
+    await _send_help_response(interaction)
 
 
 @client.tree.command(
@@ -852,6 +1400,7 @@ async def peek_team(interaction: discord.Interaction, team_number: int, year: in
     if status == 404:
         e = _base_embed(title=_team_embed_title(team_number, team_info), color=COLOR_WARN)
         e.url = f"{SITE_URL}/team/{team_number}"
+        _apply_team_thumbnail(e, team_number)
         if team_info:
             e.description = _truncate(
                 _format_team_profile(team_info) + "No team performance data found for this team.",
@@ -859,12 +1408,22 @@ async def peek_team(interaction: discord.Interaction, team_number: int, year: in
             )
         else:
             e.description = "No team performance data found for this team."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export(
+                {"team_number": team_number, "team_info": team_info, "http_status": status, "response": data}
+            ),
+        )
         return
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"http_status": status, "response": data}),
+        )
         return
 
     perfs = data.get("team_perfs") or []
@@ -872,6 +1431,7 @@ async def peek_team(interaction: discord.Interaction, team_number: int, year: in
         tn = data.get("team_number", team_number)
         e = _base_embed(title=_team_embed_title(tn, team_info), color=COLOR_WARN)
         e.url = f"{SITE_URL}/team/{tn}"
+        _apply_team_thumbnail(e, int(tn))
         if team_info:
             e.description = _truncate(
                 _format_team_profile(team_info) + "No performance rows returned for this filter.",
@@ -879,15 +1439,36 @@ async def peek_team(interaction: discord.Interaction, team_number: int, year: in
             )
         else:
             e.description = "No performance rows returned."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export(
+                {
+                    "team_number": tn,
+                    "team_info": team_info,
+                    "events_by_year": events_by_year,
+                    "team_perfs": [],
+                }
+            ),
+        )
         return
 
     tn = data.get("team_number", team_number)
     pages = _build_team_season_pages(perfs, tn, team_info, events_by_year)
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_team_season_rows_csv(perfs, tn),
+        export_json=_json_export(
+            {"team_number": tn, "team_info": team_info, "events_by_year": events_by_year, "team_perfs": perfs}
+        ),
+    )
 
 
-@client.tree.command(name="peek_event", description="General info for one event (name, dates, location, website, webcast)")
+@client.tree.command(
+    name="peek_event",
+    description="General info for one event (name, dates, week, district, location, website, webcast)",
+)
 @app_commands.describe(event_key="Event key, e.g. 2025txdal or 2024cmp")
 async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
     await interaction.response.defer(thinking=True)
@@ -896,14 +1477,22 @@ async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
     if year is None:
         e = _base_embed(title="Invalid event key", color=COLOR_WARN)
         e.description = "Could not read a 4-digit season year at the start of the key (e.g. `2025txdal`)."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "error": "invalid_event_key_year"}),
+        )
         return
 
     status, data = await api.events_for_year(year, limit=None)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "http_status": status, "response": data}),
+        )
         return
 
     events = data.get("events") or []
@@ -915,10 +1504,20 @@ async def peek_event(interaction: discord.Interaction, event_key: str) -> None:
             f"No metadata found for this key in the **{year}** event list. "
             "Check the key or try again after the API has synced."
         )
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "year": year, "events_in_response": len(events)}),
+        )
         return
 
-    await interaction.followup.send(embed=_build_event_general_embed(match, key))
+    ge = _build_event_general_embed(match, key)
+    await send_embed_with_export(
+        interaction,
+        ge,
+        export_csv=_dicts_to_csv([_event_row_flat(match)]),
+        export_json=_json_export({"event_key": key, "event": match}),
+    )
 
 
 @client.tree.command(name="peek_rankings", description="Full event rankings (W–L–T, DQ)")
@@ -930,32 +1529,53 @@ async def peek_rankings(interaction: discord.Interaction, event_key: str) -> Non
     if status == 404:
         e = _base_embed(title="No rankings", color=COLOR_WARN)
         e.description = f"No rankings for `{key}`."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "http_status": status, "response": data}),
+        )
         return
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "http_status": status, "response": data}),
+        )
         return
 
     rows = data.get("event_rankings") or []
     if not rows:
         e = _base_embed(title=data.get("event_key", key), color=COLOR_WARN)
         e.description = "No ranking rows."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": data.get("event_key", key), "event_rankings": []}),
+        )
         return
 
     ek = data.get("event_key", key)
     pages = _build_ranking_pages(rows, ek)
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_rankings_to_csv(rows),
+        export_json=_rankings_to_json(rows, ek),
+    )
 
 
-@client.tree.command(name="peek_events", description="List FRC events for a season (location filters optional)")
+@client.tree.command(
+    name="peek_events",
+    description="List FRC season events (week, district, location; optional country/state/district filters)",
+)
 @app_commands.describe(
     year="Season year, e.g. 2025",
-    limit="Max events from API (default 24; results are paginated here)",
+    limit="Max events from API (default 24; paginated in Discord)",
     state_prov="Filter by state/province code",
     district_key="District key filter",
+    country="Filter by country (e.g. USA, Canada)",
 )
 async def peek_events(
     interaction: discord.Interaction,
@@ -963,54 +1583,110 @@ async def peek_events(
     limit: int = DEFAULT_EVENTS_LIMIT,
     state_prov: str | None = None,
     district_key: str | None = None,
+    country: str | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
-    status, data = await api.events_for_year(year, limit=limit, state_prov=state_prov, district_key=district_key)
+    status, data = await api.events_for_year(
+        year,
+        limit=limit,
+        state_prov=state_prov,
+        district_key=district_key,
+        country=country,
+    )
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"year": year, "http_status": status, "response": data}),
+        )
         return
 
     events = data.get("events") or []
     if not events:
         e = _base_embed(title=f"Events {year}", color=COLOR_WARN)
         e.description = "No events match your filters."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export(
+                {
+                    "year": year,
+                    "filters": {
+                        "state_prov": state_prov,
+                        "district_key": district_key,
+                        "country": country,
+                        "limit": limit,
+                    },
+                    "events": [],
+                }
+            ),
+        )
         return
 
     pages = _build_events_list_pages(events, year)
-    await send_paginated(interaction, pages)
+    filt = {"state_prov": state_prov, "district_key": district_key, "country": country, "limit": limit}
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv([_event_row_flat(ev) for ev in events]),
+        export_json=_json_export({"year": year, "filters": filt, "events": events}),
+    )
 
 
 @client.tree.command(name="peek_event_keys", description="Event keys for a year (compact list for scripts / search)")
-@app_commands.describe(year="Season year", state_prov="Optional state filter", district_key="Optional district filter")
+@app_commands.describe(
+    year="Season year",
+    state_prov="Optional state filter",
+    district_key="Optional district filter",
+    country="Optional country filter (e.g. USA, Canada)",
+)
 async def peek_event_keys(
     interaction: discord.Interaction,
     year: int,
     state_prov: str | None = None,
     district_key: str | None = None,
+    country: str | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
-    status, data = await api.event_keys(year, state_prov=state_prov, district_key=district_key)
+    status, data = await api.event_keys(
+        year,
+        state_prov=state_prov,
+        district_key=district_key,
+        country=country,
+    )
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"year": year, "http_status": status, "response": data}),
+        )
         return
 
     keys = data.get("keys") or []
     if not keys:
         e = _base_embed(title=f"Event keys {year}", color=COLOR_WARN)
         e.description = "No keys returned."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"year": year, "filters": {"state_prov": state_prov, "district_key": district_key, "country": country}, "keys": []}),
+        )
         return
 
     pages = _build_event_keys_pages(keys, year)
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_single_column_csv(keys, "event_key"),
+        export_json=_json_export(data),
+    )
 
 
-@client.tree.command(name="peek_team_awards", description="Awards for a team (optionally one season)")
+@client.tree.command(name="peek_team_awards", description="Awards for a team, newest season first (optional year filter)")
 @app_commands.describe(team_number="FRC team number", year="Optional season year filter")
 async def peek_team_awards(interaction: discord.Interaction, team_number: int, year: int | None = None) -> None:
     await interaction.response.defer(thinking=True)
@@ -1018,19 +1694,30 @@ async def peek_team_awards(interaction: discord.Interaction, team_number: int, y
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"team_number": team_number, "year": year, "http_status": status, "response": data}),
+        )
         return
 
-    awards = data.get("awards") or []
+    awards = _sort_team_awards_newest_first(_dedupe_team_awards(list(data.get("awards") or [])))
     if not awards:
         e = _base_embed(title=f"Awards · Team {data.get('team_number', team_number)}", color=COLOR_BRAND)
         e.url = f"{SITE_URL}/team/{team_number}"
+        _apply_team_thumbnail(e, int(data.get("team_number", team_number)))
         e.description = "No awards in this filter."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
+    export_payload: Any = {**data, "awards": awards} if isinstance(data, dict) else data
     pages = _build_team_awards_pages(awards, data.get("team_number", team_number))
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv(awards),
+        export_json=_json_export(export_payload),
+    )
 
 
 @client.tree.command(name="peek_team_events", description="Event keys a team has played (optional year filter)")
@@ -1041,22 +1728,35 @@ async def peek_team_events(interaction: discord.Interaction, team_number: int, y
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"team_number": team_number, "year": year, "http_status": status, "response": data}),
+        )
         return
 
     evs = data.get("events") or []
     e = _base_embed(title=f"Events · Team {data.get('team_number', team_number)}", color=COLOR_BRAND)
     e.url = f"{SITE_URL}/team/{team_number}"
+    _apply_team_thumbnail(e, int(data.get("team_number", team_number)))
     if not evs:
         e.description = "No events in this filter."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
     pages = _build_team_events_pages(evs, data.get("team_number", team_number))
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_single_column_csv(evs, "event_key"),
+        export_json=_json_export(data),
+    )
 
 
-@client.tree.command(name="peek_event_teams", description="All team numbers registered at an event")
+@client.tree.command(
+    name="peek_event_teams",
+    description="Registered teams at an event (links, nicknames, locations; CSV/JSON export)",
+)
 @app_commands.describe(event_key="Event key, e.g. 2025txdal")
 async def peek_event_teams(interaction: discord.Interaction, event_key: str) -> None:
     await interaction.response.defer(thinking=True)
@@ -1065,21 +1765,30 @@ async def peek_event_teams(interaction: discord.Interaction, event_key: str) -> 
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "http_status": status, "response": data}),
+        )
         return
 
-    teams = data.get("teams") or []
+    rows = _coerce_event_teams_rows(data.get("teams"))
     ek = data.get("event_key", key)
-    if not teams:
+    if not rows:
         e = _base_embed(title=f"Teams · {ek}", color=COLOR_BRAND)
         e.url = f"{SITE_URL}/event/{ek}"
         e.description = "No teams listed."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
-    nums = sorted(int(t) for t in teams if t is not None)
-    pages = _build_event_teams_pages(nums, ek)
-    await send_paginated(interaction, pages)
+    export_payload: Any = {**data, "teams": rows} if isinstance(data, dict) else data
+    pages = _build_event_teams_pages(rows, ek)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv(rows),
+        export_json=_json_export(export_payload),
+    )
 
 
 @client.tree.command(name="peek_event_matches", description="Matches at an event, paginated (newest first; optional team filter)")
@@ -1095,20 +1804,30 @@ async def peek_event_matches(
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "team_number": team_number, "http_status": status, "response": data}),
+        )
         return
 
-    matches = data.get("matches") or []
+    matches = _sort_matches_newest_first(list(data.get("matches") or []))
     ek = data.get("event_key", key)
     if not matches:
         e = _base_embed(title=f"Matches · {ek}", color=COLOR_BRAND)
         e.url = f"{SITE_URL}/event/{ek}"
         e.description = "No matches returned."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
-    pages = _build_event_matches_pages(matches, ek, len(matches))
-    await send_paginated(interaction, pages)
+    pages = _build_event_matches_pages(matches, ek, len(matches), team_number=team_number)
+    export_payload: Any = {**data, "matches": matches} if isinstance(data, dict) else data
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv(matches),
+        export_json=_json_export(export_payload),
+    )
 
 
 @client.tree.command(name="peek_event_awards", description="Awards at an event (Blue Banner, etc.)")
@@ -1124,7 +1843,11 @@ async def peek_event_awards(
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "team_number": team_number, "http_status": status, "response": data}),
+        )
         return
 
     rows = data.get("teams_and_awards") or []
@@ -1133,16 +1856,21 @@ async def peek_event_awards(
         e = _base_embed(title=f"Awards · {ek}", color=COLOR_BRAND)
         e.url = f"{SITE_URL}/event/{ek}"
         e.description = "No awards returned."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
-    pages = _build_event_awards_pages(rows, ek)
-    await send_paginated(interaction, pages)
+    pages = _build_event_awards_pages(rows, ek, team_number=team_number)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_dicts_to_csv(rows),
+        export_json=_json_export(data),
+    )
 
 
 @client.tree.command(
     name="peek_event_perfs",
-    description="ACE/RAW breakdown at an event (all teams, or one team if team_number is set)",
+    description="ACE, σ (confidence), RAW, and component breakdown at an event (all teams, or one if team_key is set)",
 )
 @app_commands.describe(
     event_key="Event key",
@@ -1167,7 +1895,11 @@ async def peek_event_perfs(
     if team_key is not None and str(team_key).strip() and tk is None:
         e = _base_embed(title="Invalid team key", color=COLOR_WARN)
         e.description = "Use a team number like `254` or `frc254`."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "team_key_input": team_key, "error": "invalid_team_key"}),
+        )
         return
 
     if tk is not None:
@@ -1176,26 +1908,44 @@ async def peek_event_perfs(
             ek = key
             e = _base_embed(title=f"Event metrics · {ek} · Team {tk}", color=COLOR_WARN)
             e.url = f"{SITE_URL}/event/{ek}"
+            _apply_team_thumbnail(e, int(tk))
             e.description = f"No metrics for team **{tk}** at this event."
-            await interaction.followup.send(embed=e)
+            await send_embed_with_export(
+                interaction,
+                e,
+                export_json=_json_export({"event_key": ek, "team_number": tk, "http_status": status, "response": data}),
+            )
             return
         if status != 200:
             e = _base_embed(title="API error", color=COLOR_ERR)
             e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-            await interaction.followup.send(embed=e)
+            await send_embed_with_export(
+                interaction,
+                e,
+                export_json=_json_export({"event_key": key, "team_number": tk, "http_status": status, "response": data}),
+            )
             return
         ek = str(data.get("event_key", key))
         perfs = [data]
         sorted_p = perfs
         pages = _build_event_perfs_pages(sorted_p, ek, len(perfs), team_filter=int(tk))
-        await send_paginated(interaction, pages)
+        await send_paginated(
+            interaction,
+            pages,
+            export_csv=_event_perfs_to_csv(sorted_p, ek),
+            export_json=_event_perfs_to_json(sorted_p, ek),
+        )
         return
 
     status, data = await api.event_perfs(key)
     if status != 200:
         e = _base_embed(title="API error", color=COLOR_ERR)
         e.description = _truncate(f"HTTP **{status}** — `{_detail_from_api(data)}`", EMBED_DESC_SAFE)
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(
+            interaction,
+            e,
+            export_json=_json_export({"event_key": key, "http_status": status, "response": data}),
+        )
         return
 
     perfs = data.get("perfs") or []
@@ -1204,12 +1954,17 @@ async def peek_event_perfs(
         e = _base_embed(title=f"Event metrics · {ek}", color=COLOR_BRAND)
         e.url = f"{SITE_URL}/event/{ek}"
         e.description = "No per-team metrics."
-        await interaction.followup.send(embed=e)
+        await send_embed_with_export(interaction, e, export_json=_json_export(data))
         return
 
     sorted_p = sorted(perfs, key=ace_key, reverse=True)
     pages = _build_event_perfs_pages(sorted_p, ek, len(perfs))
-    await send_paginated(interaction, pages)
+    await send_paginated(
+        interaction,
+        pages,
+        export_csv=_event_perfs_to_csv(sorted_p, ek),
+        export_json=_event_perfs_to_json(sorted_p, ek),
+    )
 
 
 def main() -> None:
