@@ -218,6 +218,14 @@ def _team_season_rows_csv(perfs: list[dict[str, Any]], team_number: int) -> str:
         "auto_raw",
         "teleop_raw",
         "endgame_raw",
+        "rank_global",
+        "count_global",
+        "rank_country",
+        "count_country",
+        "rank_state",
+        "count_state",
+        "rank_district",
+        "count_district",
     ]
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -310,7 +318,7 @@ def _build_help_embed() -> discord.Embed:
 `/peek_ping` — Verify the API accepts your key.
 
 **Teams**
-`/peek_team` — Team profile, season ACE/RAW/record, registered events per season, and event-perf lines (optional `year`).
+`/peek_team` — Team profile, season ACE/RAW/record, ACE ranks (global/country/state/district), registered events per season, and event-perf lines (optional `year`).
 `/peek_teams` — Search teams by season; optional `country`, `state_prov`, `district_key`, `city`, `limit` (paginated).
 `/peek_team_awards` — Awards for a team, newest season first (optional `year`).
 `/peek_team_events` — Event keys a team has played (optional `year`).
@@ -342,6 +350,43 @@ def _fmt_num(x: Any, digits: int = 2) -> str:
         return f"{v:.{digits}f}"
     except (TypeError, ValueError):
         return str(x)
+
+
+def _fmt_rank_slash(rank: Any, count: Any) -> str | None:
+    """Format ACE rank as rank/total when count exists, else #rank."""
+    if rank is None:
+        return None
+    try:
+        ri = int(rank)
+    except (TypeError, ValueError):
+        return None
+    if count is not None:
+        try:
+            ci = int(count)
+            return f"{ri}/{ci}"
+        except (TypeError, ValueError):
+            pass
+    return f"#{ri}"
+
+
+def _format_team_season_ace_ranks(p: dict[str, Any]) -> str:
+    """Compact line for team_perfs: global / country / state / district ACE ranks."""
+    parts: list[str] = []
+    g = _fmt_rank_slash(p.get("rank_global"), p.get("count_global"))
+    if g:
+        parts.append(f"Global {g}")
+    c = _fmt_rank_slash(p.get("rank_country"), p.get("count_country"))
+    if c:
+        parts.append(f"Country {c}")
+    s = _fmt_rank_slash(p.get("rank_state"), p.get("count_state"))
+    if s:
+        parts.append(f"State {s}")
+    d = _fmt_rank_slash(p.get("rank_district"), p.get("count_district"))
+    if d:
+        parts.append(f"District {d}")
+    if not parts:
+        return ""
+    return " · ".join(parts)
 
 
 def _short_iso_date(s: Any) -> str:
@@ -789,6 +834,9 @@ def _build_team_season_pages(
                 f"**{y}** · RAW {raw} · ACE {ace} · σ {conf}\n"
                 f"Record **{w}–{l}–{ti}** · Auto {ar} · Teleop {tr} · Endgame {eg}"
             )
+            ranks_line = _format_team_season_ace_ranks(p)
+            if ranks_line:
+                block += f"\n_{ranks_line}_"
             if events_by_year and yi is not None:
                 reg = _format_registered_events_for_year(yi, events_by_year)
                 if reg:
